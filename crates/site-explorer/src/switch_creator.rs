@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
+use std::collections::BTreeMap;
+
 use carbide_uuid::switch::SwitchId;
 use db::DatabaseError;
 use model::expected_switch::ExpectedSwitch;
-use model::site_explorer::ExploredManagedSwitch;
+use model::site_explorer::{EndpointExplorationReport, ExploredManagedSwitch};
 use sqlx::{PgConnection, PgPool};
 
 use crate::SiteExplorerConfig;
@@ -119,14 +121,15 @@ impl SwitchCreator {
     ) -> SiteExplorerResult<Option<SwitchId>> {
         if !explored_managed_switch.nv_os_mac_addresses.is_empty() {
             let explored_macs = explored_managed_switch.nv_os_mac_addresses.clone();
-            if *explored_macs != expected_switch.nvos_mac_addresses {
-                db::expected_switch::update_nvos_mac_addresses(
-                    &mut *txn,
-                    expected_switch.bmc_mac_address,
-                    &explored_macs,
-                )
-                .await?;
-            }
+            let nvos_interfaces = nvos_interfaces(&explored_managed_switch.report);
+
+            db::expected_switch::update_discovered_nvos_interfaces(
+                &mut *txn,
+                expected_switch.bmc_mac_address,
+                &explored_macs,
+                &nvos_interfaces,
+            )
+            .await?;
         }
 
         // Defense against the duplicate-switches bug: if a switch already
@@ -222,5 +225,85 @@ impl SwitchCreator {
         }
 
         Ok(())
+    }
+}
+
+fn nvos_interfaces(
+    report: &EndpointExplorationReport,
+) -> BTreeMap<String, mac_address::MacAddress> {
+    let mut nvos_interfaces = BTreeMap::new();
+
+    for interface in report
+        .systems
+        .iter()
+        .flat_map(|system| &system.ethernet_interfaces)
+    {
+        let Some(redfish_interface_id) = interface.id.as_deref().map(str::trim) else {
+            continue;
+        };
+
+        let Some(mac_address) = interface.mac_address else {
+            continue;
+        };
+
+        if redfish_interface_id.is_empty() {
+            continue;
+        }
+
+        // Redfish reports fixed NVOS port names with inconsistent casing; RMS
+        // selection uses their canonical lowercase form.
+        nvos_interfaces
+            .entry(redfish_interface_id.to_ascii_lowercase())
+            .or_insert(mac_address);
+    }
+
+    nvos_interfaces
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use mac_address::MacAddress;
+    use model::site_explorer::{ComputerSystem, EthernetInterface};
+
+    use super::*;
+
+    #[test]
+    fn nvos_interfaces_canonicalizes_redfish_port_identity() {
+        let eth0_mac = MacAddress::from_str("02:00:00:00:00:10").unwrap();
+        let eth1_mac = MacAddress::from_str("02:00:00:00:00:11").unwrap();
+        let unnamed_mac = MacAddress::from_str("02:00:00:00:00:12").unwrap();
+
+        let report = EndpointExplorationReport {
+            systems: vec![ComputerSystem {
+                ethernet_interfaces: vec![
+                    EthernetInterface {
+                        id: Some("Eth0".to_string()),
+                        mac_address: Some(eth0_mac),
+                        ..Default::default()
+                    },
+                    EthernetInterface {
+                        id: Some("eth1".to_string()),
+                        mac_address: Some(eth1_mac),
+                        ..Default::default()
+                    },
+                    EthernetInterface {
+                        mac_address: Some(unnamed_mac),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            nvos_interfaces(&report),
+            BTreeMap::from([
+                ("eth0".to_string(), eth0_mac),
+                ("eth1".to_string(), eth1_mac),
+            ])
+        );
     }
 }

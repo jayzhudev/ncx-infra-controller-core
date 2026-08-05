@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::{DatabaseError, DatabaseResult};
 
 const SQL_VIOLATION_DUPLICATE_MAC: &str = "expected_switches_bmc_mac_address_key";
+
 pub async fn find_by_bmc_mac_address(
     txn: &mut PgConnection,
     bmc_mac_address: MacAddress,
@@ -72,7 +73,7 @@ async fn lock_expected_switch_writes(txn: &mut PgConnection) -> DatabaseResult<(
 /// already claims, if any. "Different" follows the same key `update` targets:
 /// `switch.expected_switch_id` when set, otherwise `switch.bmc_mac_address`.
 /// `macaddr` comparison canonicalizes case and separator differences.
-/// `update_nvos_mac_addresses` stays unguarded on purpose -- it records
+/// `update_discovered_nvos_interfaces` stays unguarded on purpose -- it records
 /// hardware-observed truth from site-explorer.
 async fn find_nvos_mac_claimed_elsewhere(
     txn: &mut PgConnection,
@@ -403,14 +404,30 @@ pub async fn delete_by_id(txn: &mut PgConnection, id: Uuid) -> DatabaseResult<()
     Ok(())
 }
 
-pub async fn update_nvos_mac_addresses(
+/// Update hardware-observed NVOS interface identities and the legacy MAC projection.
+///
+/// New map entries replace the matching Redfish interface identity and retain
+/// interfaces omitted by a partial report. The scalar legacy static IP remains
+/// paired with its original single MAC; it is never widened to another port.
+pub async fn update_discovered_nvos_interfaces(
     txn: &mut PgConnection,
     bmc_mac_address: MacAddress,
     nvos_mac_addresses: &[MacAddress],
+    nvos_interfaces: &BTreeMap<String, MacAddress>,
 ) -> DatabaseResult<()> {
-    let query = "UPDATE expected_switches SET nvos_mac_addresses = $1 WHERE bmc_mac_address = $2";
+    let query = r#"
+        UPDATE expected_switches
+        SET nvos_mac_addresses = CASE
+                WHEN nvos_ip_address IS NULL THEN $1
+                ELSE nvos_mac_addresses
+            END,
+            nvos_interfaces = nvos_interfaces || $2::jsonb
+        WHERE bmc_mac_address = $3
+    "#;
+
     sqlx::query(query)
         .bind(nvos_mac_addresses)
+        .bind(sqlx::types::Json(nvos_interfaces))
         .bind(bmc_mac_address)
         .execute(txn)
         .await
@@ -436,6 +453,9 @@ pub async fn clear(txn: &mut PgConnection) -> Result<(), DatabaseError> {
 
 /// update updates an existing expected switch. If expected_switch_id is set,
 /// matches by ID; otherwise matches by bmc_mac_address.
+///
+/// Changing the operator-provided NVOS MAC list clears the discovery snapshot
+/// so a stale interface identity cannot override the updated configuration.
 pub async fn update(txn: &mut PgConnection, switch: &ExpectedSwitch) -> DatabaseResult<()> {
     // The lock serializes the existence read, conflict check, and UPDATE as
     // one unit against concurrent expected-switch writers.
@@ -462,6 +482,8 @@ pub async fn update(txn: &mut PgConnection, switch: &ExpectedSwitch) -> Database
             .unwrap_or_else(|| switch.bmc_mac_address.to_string()),
     })?;
 
+    let nvos_mac_addresses_changed = switch.nvos_mac_addresses != current.nvos_mac_addresses;
+
     let newly_claimed: Vec<MacAddress> = switch
         .nvos_mac_addresses
         .iter()
@@ -480,7 +502,8 @@ pub async fn update(txn: &mut PgConnection, switch: &ExpectedSwitch) -> Database
                      metadata_name=$5, metadata_description=$6, metadata_labels=$7, \
                      rack_id=$8, nvos_username=$9, nvos_password=$10, nvos_mac_addresses=$11::macaddr[], \
                      bmc_retain_credentials=COALESCE($12, bmc_retain_credentials), \
-                     nvos_ip_address=$13::inet \
+                     nvos_ip_address=$13::inet, \
+                     nvos_interfaces=CASE WHEN $15 THEN '{}'::jsonb ELSE nvos_interfaces END \
                  WHERE ",
                 $where_clause,
             )
@@ -513,6 +536,7 @@ pub async fn update(txn: &mut PgConnection, switch: &ExpectedSwitch) -> Database
         .bind(switch.bmc_retain_credentials)
         .bind(switch.nvos_ip_address)
         .bind(&target_id)
+        .bind(nvos_mac_addresses_changed)
         .execute(&mut *txn)
         .await
         .map_err(|err| DatabaseError::query(query, err))?;

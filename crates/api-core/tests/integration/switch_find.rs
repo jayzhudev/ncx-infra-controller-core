@@ -298,7 +298,16 @@ async fn test_find_switches_by_ids_returns_no_nvos_info_when_unresolved(
     let mut txn = env.db_txn().await;
     let rows = db::switch::find_switch_endpoints_by_ids(txn.as_mut(), &[switch_id]).await?;
     let bmc_mac = rows.first().expect("switch endpoint row").bmc_mac;
-    db::expected_switch::update_nvos_mac_addresses(&mut txn, bmc_mac, &[]).await?;
+
+    sqlx::query(
+        "UPDATE expected_switches
+         SET nvos_mac_addresses = '{}'::macaddr[], nvos_interfaces = '{}'::jsonb
+         WHERE bmc_mac_address = $1",
+    )
+    .bind(bmc_mac)
+    .execute(&mut txn)
+    .await?;
+
     txn.commit().await?;
 
     let response = env

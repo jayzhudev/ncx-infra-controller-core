@@ -39,6 +39,8 @@ use crate::{
     ColumnInfo, DatabaseError, DatabaseResult, FilterableQueryBuilder, ObjectColumnFilter,
 };
 
+pub(crate) const NVOS_RMS_HOST_INTERFACE_ID: &str = "eth0";
+
 #[cfg(test)]
 mod test_metadata;
 
@@ -688,11 +690,11 @@ pub async fn clear_bmc_credential_rotation_requested(
     Ok(())
 }
 
-/// Full endpoint info for a switch: BMC MAC/IP and optionally NVOS MAC/IP.
+/// Full endpoint info for a switch: BMC MAC/IP and optionally the NVOS eth0 MAC/IP.
 ///
 /// NVOS fields are nullable because `nvos_mac_addresses` may not be set on the
-/// expected switch, or the corresponding `machine_interfaces` / addresses may
-/// not exist yet.
+/// expected switch, eth0 may not have been discovered yet, or the corresponding
+/// `machine_interfaces` / addresses may not exist yet.
 #[derive(Debug, sqlx::FromRow)]
 pub struct SwitchEndpointRow {
     pub switch_id: SwitchId,
@@ -715,54 +717,100 @@ pub struct ReadyControlPlaneSwitchEndpointRow {
 
 /// Resolve SwitchIds to full endpoint info (BMC + NVOS MAC/IP).
 ///
-/// Uses `DISTINCT ON (s.id)` to avoid duplicate rows when a MAC has multiple
-/// addresses. NVOS resolution uses LEFT JOINs so switches without NVOS info
-/// are still returned (with NULL nvos_mac / nvos_ip).
+/// Uses a deterministic IPv4-first address selection for each endpoint. NVOS
+/// resolution uses the discovered Redfish eth0 mapping when it is available.
+/// When a MAC has several interface rows, the lowest interface ID wins before
+/// address ordering.
+/// A legacy single-MAC switch, including a preserved static reservation with
+/// no eth0 identity yet, falls back to that MAC. The configured static NVOS IP
+/// is matched exactly and remains paired with its sole stored MAC; otherwise
+/// the endpoint comes from an Admin segment. Each switch resolves to at most
+/// one BMC or NVOS interface/address pair, even when a MAC exists on multiple
+/// segments. A switch with several unmapped NVOS MACs intentionally has no
+/// endpoint rather than pairing RMS with an arbitrary port.
 ///
 /// Path:
 ///   switches.bmc_mac_address -> expected_switches.bmc_mac_address (BMC MAC)
 ///   -> machine_interfaces (by bmc_mac) -> machine_interface_addresses (underlay) -> BMC IP
-///   -> expected_switches.nvos_mac_addresses (NVOS MAC, nullable)
-///   -> machine_interfaces (by nvos_mac) -> machine_interface_addresses -> NVOS IP
+///   -> expected_switches.nvos_interfaces (Redfish eth0 NVOS MAC, nullable)
+///   -> expected_switches.nvos_mac_addresses (single-MAC legacy fallback)
+///   -> machine_interfaces and machine_interface_addresses (static exact IP or Admin) -> NVOS IP
 pub async fn find_switch_endpoints_by_ids(
     db: impl crate::db_read::DbReader<'_>,
     switch_ids: &[SwitchId],
 ) -> DatabaseResult<Vec<SwitchEndpointRow>> {
     let sql = r#"
-        SELECT DISTINCT ON (s.id)
+        SELECT
             s.id                 AS switch_id,
             es.bmc_mac_address   AS bmc_mac,
-            bmc_mia.address      AS bmc_ip,
-            nvos_mi.mac_address  AS nvos_mac,
-            nvos_mia.address     AS nvos_ip,
+            bmc_endpoint.address AS bmc_ip,
+            nvos_endpoint.mac_address AS nvos_mac,
+            nvos_endpoint.address AS nvos_ip,
             CASE
                 WHEN nvos_d.name IS NOT NULL AND nvos_d.name <> '' THEN
-                    nvos_mi.hostname || '.' || nvos_d.name
-                ELSE nvos_mi.hostname
+                    nvos_endpoint.hostname || '.' || nvos_d.name
+                ELSE nvos_endpoint.hostname
             END                  AS nvos_hostname
         FROM switches s
         JOIN expected_switches es
             ON es.bmc_mac_address = s.bmc_mac_address
-        JOIN machine_interfaces bmc_mi
-            ON bmc_mi.mac_address = es.bmc_mac_address
-        JOIN machine_interface_addresses bmc_mia
-            ON bmc_mia.interface_id = bmc_mi.id
-        JOIN network_segments bmc_ns
-            ON bmc_ns.id = bmc_mi.segment_id
-        LEFT JOIN machine_interfaces nvos_mi
-            ON es.nvos_mac_addresses IS NOT NULL
-           AND nvos_mi.mac_address = ANY(es.nvos_mac_addresses)
-        LEFT JOIN machine_interface_addresses nvos_mia
-            ON nvos_mia.interface_id = nvos_mi.id
+        JOIN LATERAL (
+            SELECT bmc_mia.address
+            FROM machine_interfaces bmc_mi
+            JOIN machine_interface_addresses bmc_mia
+                ON bmc_mia.interface_id = bmc_mi.id
+            JOIN network_segments bmc_ns
+                ON bmc_ns.id = bmc_mi.segment_id
+            WHERE bmc_mi.mac_address = es.bmc_mac_address
+              AND bmc_ns.network_segment_type = 'underlay'
+            ORDER BY bmc_mi.id, family(bmc_mia.address), bmc_mia.address
+            LIMIT 1
+        ) bmc_endpoint
+            ON true
+        LEFT JOIN LATERAL (
+            SELECT
+                nvos_mi.mac_address,
+                nvos_mi.hostname,
+                nvos_mi.domain_id,
+                nvos_mia.address
+            FROM machine_interfaces nvos_mi
+            JOIN machine_interface_addresses nvos_mia
+                ON nvos_mia.interface_id = nvos_mi.id
+            JOIN network_segments nvos_ns
+                ON nvos_ns.id = nvos_mi.segment_id
+            WHERE nvos_mi.mac_address = CASE
+                WHEN es.nvos_ip_address IS NOT NULL
+                    AND cardinality(es.nvos_mac_addresses) = 1
+                THEN es.nvos_mac_addresses[1]
+                ELSE COALESCE(
+                    (es.nvos_interfaces ->> $2)::macaddr,
+                    CASE
+                        WHEN es.nvos_interfaces = '{}'::jsonb
+                            AND cardinality(es.nvos_mac_addresses) = 1
+                        THEN es.nvos_mac_addresses[1]
+                    END
+                )
+            END
+              AND (
+                  (es.nvos_ip_address IS NOT NULL AND nvos_mia.address = es.nvos_ip_address)
+                  OR (
+                      es.nvos_ip_address IS NULL
+                      AND nvos_ns.network_segment_type = 'admin'
+                  )
+              )
+            ORDER BY nvos_mi.id, family(nvos_mia.address), nvos_mia.address
+            LIMIT 1
+        ) nvos_endpoint
+            ON true
         LEFT JOIN domains nvos_d
-            ON nvos_d.id = nvos_mi.domain_id
+            ON nvos_d.id = nvos_endpoint.domain_id
         WHERE s.id = ANY($1)
-          AND bmc_ns.network_segment_type = 'underlay'
         ORDER BY s.id
     "#;
 
     sqlx::query_as(sql)
         .bind(switch_ids)
+        .bind(NVOS_RMS_HOST_INTERFACE_ID)
         .fetch_all(db)
         .await
         .map_err(|err| DatabaseError::new("switch::find_switch_endpoints_by_ids", err))
@@ -770,7 +818,10 @@ pub async fn find_switch_endpoints_by_ids(
 
 /// Resolve one ready Fabric Manager control-plane switch endpoint per rack.
 ///
-/// When several switches in a rack match, the primary switch is preferred.
+/// When several switches in a rack match, the primary switch is preferred. NVOS
+/// selection matches a configured static IP exactly and otherwise uses an
+/// Admin-segment address. A configured static IP remains paired with its sole
+/// persisted MAC even if discovery reports a different eth0 identity.
 pub async fn find_ready_control_plane_configured_switch_endpoints<DB>(
     db: &mut DB,
 ) -> DatabaseResult<Vec<ReadyControlPlaneSwitchEndpointRow>>
@@ -782,17 +833,43 @@ where
             s.id               AS switch_id,
             s.rack_id          AS rack_id,
             r.rack_profile_id  AS rack_profile_id,
-            nvos_mia.address   AS nvos_ip
+            nvos_endpoint.address AS nvos_ip
         FROM switches s
         LEFT JOIN racks r
             ON r.id = s.rack_id
         JOIN expected_switches es
             ON es.bmc_mac_address = s.bmc_mac_address
-        JOIN machine_interfaces nvos_mi
-            ON es.nvos_mac_addresses IS NOT NULL
-           AND nvos_mi.mac_address = ANY(es.nvos_mac_addresses)
-        JOIN machine_interface_addresses nvos_mia
-            ON nvos_mia.interface_id = nvos_mi.id
+        JOIN LATERAL (
+            SELECT nvos_mia.address
+            FROM machine_interfaces nvos_mi
+            JOIN machine_interface_addresses nvos_mia
+                ON nvos_mia.interface_id = nvos_mi.id
+            JOIN network_segments nvos_ns
+                ON nvos_ns.id = nvos_mi.segment_id
+            WHERE nvos_mi.mac_address = CASE
+                WHEN es.nvos_ip_address IS NOT NULL
+                    AND cardinality(es.nvos_mac_addresses) = 1
+                THEN es.nvos_mac_addresses[1]
+                ELSE COALESCE(
+                    (es.nvos_interfaces ->> $4)::macaddr,
+                    CASE
+                        WHEN es.nvos_interfaces = '{}'::jsonb
+                            AND cardinality(es.nvos_mac_addresses) = 1
+                        THEN es.nvos_mac_addresses[1]
+                    END
+                )
+            END
+              AND (
+                  (es.nvos_ip_address IS NOT NULL AND nvos_mia.address = es.nvos_ip_address)
+                  OR (
+                      es.nvos_ip_address IS NULL
+                      AND nvos_ns.network_segment_type = 'admin'
+                  )
+              )
+            ORDER BY nvos_mi.id, family(nvos_mia.address), nvos_mia.address
+            LIMIT 1
+        ) nvos_endpoint
+            ON true
         WHERE s.rack_id IS NOT NULL
           AND s.deleted IS NULL
           AND s.controller_state->>'state' = $1
@@ -805,6 +882,7 @@ where
         .bind(SWITCH_CONTROLLER_STATE_READY)
         .bind(FabricManagerState::Ok.as_str())
         .bind(CONTROL_PLANE_STATE_CONFIGURED)
+        .bind(NVOS_RMS_HOST_INTERFACE_ID)
         .fetch_all(&mut *db)
         .await
         .map_err(|err| {
@@ -933,12 +1011,18 @@ pub async fn remove_health_report(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::str::FromStr;
 
     use carbide_uuid::machine::MachineInterfaceId;
     use carbide_uuid::network::NetworkSegmentId;
     use carbide_uuid::rack::{RackId, RackProfileId};
+    use model::address_selection_strategy::AddressSelectionStrategy;
     use model::allocation_type::AllocationType;
+    use model::network_prefix::NewNetworkPrefix;
+    use model::network_segment::{
+        AllocationStrategy, NetworkSegmentControllerState, NetworkSegmentType, NewNetworkSegment,
+    };
     use model::rack::RackConfig;
     use model::switch::{
         CONTROL_PLANE_STATE_CONFIGURED, FabricManagerState, FabricManagerStatus, NewSwitch,
@@ -1232,7 +1316,7 @@ mod tests {
     }
 
     #[crate::sqlx_test]
-    async fn test_find_ready_control_plane_configured_switch_endpoints_prefers_primary(
+    async fn test_find_ready_control_plane_configured_switch_endpoints_prefers_primary_static_ip(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let rack_id: RackId = "rack-sw-endpoint".parse().unwrap();
@@ -1290,12 +1374,51 @@ mod tests {
         }
         set_primary_switch_for_rack(txn.as_mut(), &rack_id, &primary_switch.id).await?;
 
-        let expected_nvos_ip = find_switch_endpoints_by_ids(txn.as_mut(), &[primary_switch.id])
+        let primary_endpoint = find_switch_endpoints_by_ids(txn.as_mut(), &[primary_switch.id])
             .await?
             .pop()
-            .expect("primary switch endpoint")
-            .nvos_ip
-            .expect("primary switch nvos ip");
+            .expect("primary switch endpoint");
+
+        let primary_nvos_mac = primary_endpoint.nvos_mac.expect("primary switch nvos MAC");
+
+        let primary_bmc_mac = primary_switch
+            .bmc_mac_address
+            .expect("primary switch BMC MAC");
+
+        let static_ip: IpAddr = "192.0.1.250".parse()?;
+        let underlay = crate::network_segment::find_by_name(txn.as_mut(), "UNDERLAY").await?;
+
+        crate::machine_interface::create(
+            txn.as_mut(),
+            std::slice::from_ref(&underlay),
+            &primary_nvos_mac,
+            false,
+            AddressSelectionStrategy::StaticAddress(static_ip),
+            None,
+        )
+        .await?;
+
+        sqlx::query("UPDATE expected_switches SET nvos_ip_address = $1 WHERE bmc_mac_address = $2")
+            .bind(static_ip)
+            .bind(primary_bmc_mac)
+            .execute(txn.as_mut())
+            .await?;
+
+        let discovered_eth0_mac = MacAddress::new([0x44, 0x44, 0x33, 0x44, 2, 1]);
+
+        crate::expected_switch::update_discovered_nvos_interfaces(
+            txn.as_mut(),
+            primary_bmc_mac,
+            &[primary_nvos_mac],
+            &BTreeMap::from([(NVOS_RMS_HOST_INTERFACE_ID.to_string(), discovered_eth0_mac)]),
+        )
+        .await?;
+
+        let full_endpoints =
+            find_switch_endpoints_by_ids(txn.as_mut(), &[primary_switch.id]).await?;
+
+        assert_eq!(full_endpoints.len(), 1);
+        assert_eq!(full_endpoints[0].nvos_ip, Some(static_ip));
 
         let endpoints = find_ready_control_plane_configured_switch_endpoints(txn.as_mut()).await?;
         let rack_endpoints = endpoints
@@ -1306,8 +1429,259 @@ mod tests {
         assert_eq!(rack_endpoints.len(), 1);
         assert_eq!(rack_endpoints[0].switch_id, primary_switch.id);
         assert_eq!(rack_endpoints[0].rack_id, rack_id);
-        assert_eq!(rack_endpoints[0].nvos_ip, expected_nvos_ip);
+        assert_eq!(rack_endpoints[0].nvos_ip, static_ip);
         txn.rollback().await?;
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn switch_endpoints_select_eth0_over_an_unordered_legacy_mac_list(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut txn = pool.begin().await?;
+        let switch = create_seeded_discovered(txn.as_mut(), 31, "eth0 endpoint").await?;
+        let bmc_mac = switch.bmc_mac_address.expect("seeded switch BMC MAC");
+
+        let original_endpoint = find_switch_endpoints_by_ids(txn.as_mut(), &[switch.id])
+            .await?
+            .pop()
+            .expect("seeded switch endpoint");
+
+        let eth0_mac = original_endpoint.nvos_mac.expect("seeded eth0 MAC");
+        let eth0_ip = original_endpoint.nvos_ip.expect("seeded eth0 IP");
+        let eth1_mac = MacAddress::new([0x44, 0x44, 0x33, 0x44, 31, 0]);
+        let admin_segments = crate::network_segment::admin(txn.as_mut()).await?;
+
+        crate::machine_interface::create(
+            txn.as_mut(),
+            &admin_segments,
+            &eth1_mac,
+            false,
+            AddressSelectionStrategy::NextAvailableIp,
+            None,
+        )
+        .await?;
+
+        crate::expected_switch::update_discovered_nvos_interfaces(
+            txn.as_mut(),
+            bmc_mac,
+            &[eth1_mac, eth0_mac],
+            &BTreeMap::from([
+                ("eth1".to_string(), eth1_mac),
+                (NVOS_RMS_HOST_INTERFACE_ID.to_string(), eth0_mac),
+            ]),
+        )
+        .await?;
+
+        let selected = find_switch_endpoints_by_ids(txn.as_mut(), &[switch.id])
+            .await?
+            .pop()
+            .expect("switch endpoint");
+
+        assert_eq!(selected.nvos_mac, Some(eth0_mac));
+        assert_eq!(selected.nvos_ip, Some(eth0_ip));
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn switch_endpoints_return_one_bmc_address_when_bmc_mac_spans_underlay_segments(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut txn = pool.begin().await?;
+        let switch = create_seeded_discovered(txn.as_mut(), 35, "duplicate BMC endpoint").await?;
+
+        let original_endpoint = find_switch_endpoints_by_ids(txn.as_mut(), &[switch.id])
+            .await?
+            .pop()
+            .expect("seeded switch endpoint");
+
+        let secondary_underlay = crate::network_segment::persist(
+            NewNetworkSegment {
+                name: "UNDERLAY_SECONDARY".to_string(),
+                subdomain_id: None,
+                vpc_id: None,
+                mtu: 1500,
+                prefixes: vec![NewNetworkPrefix {
+                    prefix: "192.0.3.0/24".parse().unwrap(),
+                    gateway: Some("192.0.3.1".parse().unwrap()),
+                    dhcpv6_link_address: None,
+                    num_reserved: 3,
+                }],
+                vlan_id: None,
+                vni: None,
+                segment_type: NetworkSegmentType::Underlay,
+                id: uuid::Uuid::new_v4().into(),
+                can_stretch: None,
+                allocation_strategy: AllocationStrategy::Dynamic,
+            },
+            txn.as_mut(),
+            NetworkSegmentControllerState::Ready,
+        )
+        .await?;
+
+        crate::machine_interface::create(
+            txn.as_mut(),
+            std::slice::from_ref(&secondary_underlay),
+            &original_endpoint.bmc_mac,
+            false,
+            AddressSelectionStrategy::NextAvailableIp,
+            None,
+        )
+        .await?;
+
+        let endpoints = find_switch_endpoints_by_ids(txn.as_mut(), &[switch.id]).await?;
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].bmc_mac, original_endpoint.bmc_mac);
+        assert_eq!(endpoints[0].bmc_ip, original_endpoint.bmc_ip);
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn switch_endpoints_return_one_admin_address_when_discovered_mac_spans_segments(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut txn = pool.begin().await?;
+
+        let switch =
+            create_seeded_discovered(txn.as_mut(), 34, "duplicate segment endpoint").await?;
+
+        let bmc_mac = switch.bmc_mac_address.expect("seeded switch BMC MAC");
+
+        let original_endpoint = find_switch_endpoints_by_ids(txn.as_mut(), &[switch.id])
+            .await?
+            .pop()
+            .expect("seeded switch endpoint");
+
+        let eth0_mac = original_endpoint.nvos_mac.expect("seeded eth0 MAC");
+        let eth0_ip = original_endpoint.nvos_ip.expect("seeded eth0 IP");
+        let underlay = crate::network_segment::find_by_name(txn.as_mut(), "UNDERLAY").await?;
+
+        crate::machine_interface::create(
+            txn.as_mut(),
+            std::slice::from_ref(&underlay),
+            &eth0_mac,
+            false,
+            AddressSelectionStrategy::NextAvailableIp,
+            None,
+        )
+        .await?;
+
+        crate::expected_switch::update_discovered_nvos_interfaces(
+            txn.as_mut(),
+            bmc_mac,
+            &[eth0_mac],
+            &BTreeMap::from([(NVOS_RMS_HOST_INTERFACE_ID.to_string(), eth0_mac)]),
+        )
+        .await?;
+
+        let endpoints = find_switch_endpoints_by_ids(txn.as_mut(), &[switch.id]).await?;
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].nvos_mac, Some(eth0_mac));
+        assert_eq!(endpoints[0].nvos_ip, Some(eth0_ip));
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn switch_endpoints_do_not_select_from_multiple_unmapped_legacy_macs(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut txn = pool.begin().await?;
+        let switch = create_seeded_discovered(txn.as_mut(), 32, "ambiguous endpoint").await?;
+        let bmc_mac = switch.bmc_mac_address.expect("seeded switch BMC MAC");
+
+        let eth0_mac = find_switch_endpoints_by_ids(txn.as_mut(), &[switch.id])
+            .await?
+            .pop()
+            .expect("seeded switch endpoint")
+            .nvos_mac
+            .expect("seeded eth0 MAC");
+
+        let eth1_mac = MacAddress::new([0x44, 0x44, 0x33, 0x44, 32, 0]);
+        let admin_segments = crate::network_segment::admin(txn.as_mut()).await?;
+
+        crate::machine_interface::create(
+            txn.as_mut(),
+            &admin_segments,
+            &eth1_mac,
+            false,
+            AddressSelectionStrategy::NextAvailableIp,
+            None,
+        )
+        .await?;
+
+        crate::expected_switch::update_discovered_nvos_interfaces(
+            txn.as_mut(),
+            bmc_mac,
+            &[eth0_mac, eth1_mac],
+            &BTreeMap::new(),
+        )
+        .await?;
+
+        let selected = find_switch_endpoints_by_ids(txn.as_mut(), &[switch.id])
+            .await?
+            .pop()
+            .expect("switch endpoint");
+
+        assert_eq!(selected.nvos_mac, None);
+        assert_eq!(selected.nvos_ip, None);
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn switch_endpoints_preserve_static_reservation_when_eth0_identity_conflicts(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut txn = pool.begin().await?;
+        let switch = create_seeded_discovered(txn.as_mut(), 33, "static legacy endpoint").await?;
+        let bmc_mac = switch.bmc_mac_address.expect("seeded switch BMC MAC");
+
+        let eth0_mac = find_switch_endpoints_by_ids(txn.as_mut(), &[switch.id])
+            .await?
+            .pop()
+            .expect("seeded switch endpoint")
+            .nvos_mac
+            .expect("seeded eth0 MAC");
+
+        let eth1_mac = MacAddress::new([0x44, 0x44, 0x33, 0x44, 33, 0]);
+        let static_ip: IpAddr = "192.0.1.250".parse()?;
+        let underlay = crate::network_segment::find_by_name(txn.as_mut(), "UNDERLAY").await?;
+
+        crate::machine_interface::create(
+            txn.as_mut(),
+            std::slice::from_ref(&underlay),
+            &eth0_mac,
+            false,
+            AddressSelectionStrategy::StaticAddress(static_ip),
+            None,
+        )
+        .await?;
+
+        sqlx::query("UPDATE expected_switches SET nvos_ip_address = $1 WHERE bmc_mac_address = $2")
+            .bind(static_ip)
+            .bind(bmc_mac)
+            .execute(txn.as_mut())
+            .await?;
+
+        crate::expected_switch::update_discovered_nvos_interfaces(
+            txn.as_mut(),
+            bmc_mac,
+            &[eth0_mac],
+            &BTreeMap::from([(NVOS_RMS_HOST_INTERFACE_ID.to_string(), eth1_mac)]),
+        )
+        .await?;
+
+        let endpoints = find_switch_endpoints_by_ids(txn.as_mut(), &[switch.id]).await?;
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].nvos_mac, Some(eth0_mac));
+        assert_eq!(endpoints[0].nvos_ip, Some(static_ip));
 
         Ok(())
     }

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use model::expected_switch::ExpectedSwitch;
 use model::metadata::Metadata;
@@ -231,10 +231,12 @@ async fn test_update_tolerates_preexisting_nvos_mac_overlap(
     // the conflict guard: switch 0 ends up holding switch 1's MAC too.
     let mut overlapped = switches[0].nvos_mac_addresses.clone();
     overlapped.extend(switches[1].nvos_mac_addresses.iter().copied());
-    db::expected_switch::update_nvos_mac_addresses(
+
+    db::expected_switch::update_discovered_nvos_interfaces(
         &mut txn,
         switches[0].bmc_mac_address,
         &overlapped,
+        &BTreeMap::new(),
     )
     .await?;
 
@@ -244,6 +246,127 @@ async fn test_update_tolerates_preexisting_nvos_mac_overlap(
     own.nvos_mac_addresses = overlapped;
     own.bmc_username = "NEWADMIN".into();
     db::expected_switch::update(&mut txn, &own).await?;
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn partial_discovery_retains_previously_observed_nvos_interfaces(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut txn = pool.begin().await?;
+    let switch = create_expected_switch(&mut txn, 0).await;
+    let eth0_mac = switch.nvos_mac_addresses[0];
+    let eth1_mac = expected_switch_nvos_mac_address(1);
+
+    db::expected_switch::update_discovered_nvos_interfaces(
+        &mut txn,
+        switch.bmc_mac_address,
+        &[eth0_mac],
+        &BTreeMap::from([("eth0".to_string(), eth0_mac)]),
+    )
+    .await?;
+
+    db::expected_switch::update_discovered_nvos_interfaces(
+        &mut txn,
+        switch.bmc_mac_address,
+        &[eth1_mac],
+        &BTreeMap::from([("eth1".to_string(), eth1_mac)]),
+    )
+    .await?;
+
+    let snapshot_eth0: mac_address::MacAddress = sqlx::query_scalar(
+        "SELECT (nvos_interfaces ->> 'eth0')::macaddr \
+         FROM expected_switches WHERE bmc_mac_address = $1",
+    )
+    .bind(switch.bmc_mac_address)
+    .fetch_one(txn.as_mut())
+    .await?;
+
+    let snapshot_eth1: mac_address::MacAddress = sqlx::query_scalar(
+        "SELECT (nvos_interfaces ->> 'eth1')::macaddr \
+         FROM expected_switches WHERE bmc_mac_address = $1",
+    )
+    .bind(switch.bmc_mac_address)
+    .fetch_one(txn.as_mut())
+    .await?;
+
+    let legacy_macs: Vec<mac_address::MacAddress> = sqlx::query_scalar(
+        "SELECT nvos_mac_addresses FROM expected_switches WHERE bmc_mac_address = $1",
+    )
+    .bind(switch.bmc_mac_address)
+    .fetch_one(txn.as_mut())
+    .await?;
+
+    assert_eq!(snapshot_eth0, eth0_mac);
+    assert_eq!(snapshot_eth1, eth1_mac);
+    assert_eq!(legacy_macs, vec![eth1_mac]);
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn update_clears_discovered_nvos_interfaces_when_nvos_macs_change(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut txn = pool.begin().await?;
+    let mut switch = create_expected_switch(&mut txn, 0).await;
+    let eth0_mac = switch.nvos_mac_addresses[0];
+
+    db::expected_switch::update_discovered_nvos_interfaces(
+        &mut txn,
+        switch.bmc_mac_address,
+        &[eth0_mac],
+        &BTreeMap::from([("eth0".to_string(), eth0_mac)]),
+    )
+    .await?;
+
+    switch.nvos_mac_addresses = vec![expected_switch_nvos_mac_address(99)];
+    db::expected_switch::update(&mut txn, &switch).await?;
+
+    let snapshot_is_empty: bool = sqlx::query_scalar(
+        "SELECT nvos_interfaces = '{}'::jsonb \
+         FROM expected_switches WHERE bmc_mac_address = $1",
+    )
+    .bind(switch.bmc_mac_address)
+    .fetch_one(txn.as_mut())
+    .await?;
+
+    assert!(snapshot_is_empty);
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn discovery_preserves_the_single_mac_paired_with_a_static_nvos_ip(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut txn = pool.begin().await?;
+    let mut switch = create_expected_switch(&mut txn, 0).await;
+    let eth0_mac = switch.nvos_mac_addresses[0];
+    let eth1_mac = expected_switch_nvos_mac_address(1);
+    switch.nvos_ip_address = Some("192.0.2.50".parse()?);
+    db::expected_switch::update(&mut txn, &switch).await?;
+
+    db::expected_switch::update_discovered_nvos_interfaces(
+        &mut txn,
+        switch.bmc_mac_address,
+        &[eth0_mac, eth1_mac],
+        &BTreeMap::from([
+            ("eth0".to_string(), eth0_mac),
+            ("eth1".to_string(), eth1_mac),
+        ]),
+    )
+    .await?;
+
+    let legacy_macs: Vec<mac_address::MacAddress> = sqlx::query_scalar(
+        "SELECT nvos_mac_addresses FROM expected_switches WHERE bmc_mac_address = $1",
+    )
+    .bind(switch.bmc_mac_address)
+    .fetch_one(txn.as_mut())
+    .await?;
+
+    assert_eq!(legacy_macs, vec![eth0_mac]);
 
     Ok(())
 }
