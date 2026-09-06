@@ -441,7 +441,7 @@ selected by the rack or component backend. Refer to
 ### Rack profile firmware object
 
 A rack profile can specify one firmware-object JSON document to use as the
-default firmware input during rack ingestion:
+default input for automatic rack firmware and switch NVOS updates:
 
 ```toml
 [rack_profiles.NVL72]
@@ -463,6 +463,12 @@ count = 9
 vendor = "LiteOn"
 count = 8
 ```
+
+The SOT JSON must contain an NVOS image that matches each switch in the rack.
+RMS reports a missing matching image as an update failure. After every NVOS
+image job finishes, NICo uses RMS to restore the desired NVOS admin password
+before rack maintenance advances. Without `firmware_object`, NICo skips both
+automatic update phases.
 
 The `url` field identifies the document location. The optional `fetch_timeout`
 field accepts duration strings such as `30s` and `60s` and defaults to `30s`.

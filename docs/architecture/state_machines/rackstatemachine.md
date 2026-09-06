@@ -191,7 +191,7 @@ FirmwareUpgrade(Start -> WaitForComplete)
 | Sub-state | Description |
 |-----------|-------------|
 | **FirmwareUpgrade** | Rack-level RMS firmware upgrade for scoped machines and switches. Sets per-device `firmware_upgrade_status` and drives switch `ReProvisioning::WaitingForRackFirmwareUpgrade` / machine `HostReprovision`. |
-| **NVOSUpdate** | NVOS image update for scoped switches. Sets `nvos_update_status` and drives switch `ReProvisioning::WaitingForNVOSUpgrade`. |
+| **NVOSUpdate** | NVOS image update and NVOS admin password recovery for scoped switches. Sets `nvos_update_status` and drives switch `ReProvisioning::WaitingForNVOSUpgrade`. |
 | **ConfigureNmxCluster** | NMX cluster setup. Submits the asynchronous RMS ScaleUpFabricManager job for the full rack fabric, then waits for it to complete. See sub-states below. |
 | **PowerSequence** | Optional power-on/off/reset sequencing for scoped devices. |
 | **Completed** | All requested maintenance activities finished; rack advances to validation. |
